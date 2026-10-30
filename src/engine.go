@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,7 +31,7 @@ type routeCache struct {
 	selection selection
 	lastUsed  time.Time
 	retryAt   time.Time
-	loading   bool
+	loading   chan struct{}
 	queued    *pluginapi.SchedulerPickRequest
 }
 
@@ -88,11 +89,13 @@ func (e *engine) start() {
 				}
 				result := e.loadSelection(ctx, req)
 				e.mu.Lock()
-				entry.selection, entry.loading = result, false
+				entry.selection = result
 				entry.retryAt = e.now().Add(e.cfg.RetryInterval)
 				if result.nextReset.After(e.now()) && result.nextReset.Before(entry.retryAt) {
 					entry.retryAt = result.nextReset
 				}
+				close(entry.loading)
+				entry.loading = nil
 				e.mu.Unlock()
 			}
 		}
@@ -115,6 +118,16 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	if e.cfg.ManagementKey == "" {
 		return pluginapi.SchedulerPickResponse{}
 	}
+	var pinnedAuthID string
+	switch value := req.Options.Metadata["pinned_auth_id"].(type) {
+	case string:
+		pinnedAuthID = value
+	case []byte:
+		pinnedAuthID = string(value)
+	}
+	if strings.TrimSpace(pinnedAuthID) != "" {
+		return pluginapi.SchedulerPickResponse{}
+	}
 	providers := append([]string(nil), req.Providers...)
 	sort.Strings(providers)
 	encodedProviders, _ := json.Marshal(providers)
@@ -122,7 +135,11 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 
 	candidates := make([]pluginapi.SchedulerAuthCandidate, 0, len(req.Candidates))
 	for _, candidate := range req.Candidates {
-		if candidate.ID != "" && e.cfg.manages(candidate.Provider) {
+		if candidate.ID == "" {
+			continue
+		}
+		switch candidate.Provider {
+		case "claude", "anthropic", "codex":
 			candidates = append(candidates, pluginapi.SchedulerAuthCandidate{ID: candidate.ID, Provider: candidate.Provider})
 		}
 	}
@@ -132,14 +149,14 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	req = pluginapi.SchedulerPickRequest{Model: req.Model, Candidates: candidates}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.stopped {
+	if e.stopped || e.cancel == nil {
+		e.mu.Unlock()
 		return pluginapi.SchedulerPickResponse{}
 	}
 	now := e.now()
 	if !now.Before(e.nextPrune) {
 		for route, entry := range e.routes {
-			if !entry.loading && !now.Before(entry.retryAt) && now.Sub(entry.lastUsed) >= e.cfg.CacheTTL {
+			if entry.loading == nil && !now.Before(entry.retryAt) && now.Sub(entry.lastUsed) >= e.cfg.CacheTTL {
 				delete(e.routes, route)
 			}
 		}
@@ -150,27 +167,55 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 		entry = &routeCache{}
 		e.routes[key] = entry
 	}
-	entry.lastUsed = now
-	if entry.loading {
-		return pluginapi.SchedulerPickResponse{}
-	}
-	previous := entry.selection
-	if previous.account.id != "" && !now.Before(previous.loadedAt) && now.Before(previous.validUntil) {
-		for _, candidate := range candidates {
-			if previous.account == (accountKey{authID(candidate.ID), candidate.Provider}) {
-				return pluginapi.SchedulerPickResponse{Handled: true, AuthID: candidate.ID}
+	var timer *time.Timer
+	var timeout <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		if e.stopped {
+			e.mu.Unlock()
+			return pluginapi.SchedulerPickResponse{}
+		}
+		now = e.now()
+		entry.lastUsed = now
+		previous := entry.selection
+		if previous.account.id != "" && !now.Before(previous.loadedAt) && now.Before(previous.validUntil) {
+			for _, candidate := range candidates {
+				if previous.account == (accountKey{authID(candidate.ID), candidate.Provider}) {
+					e.mu.Unlock()
+					return pluginapi.SchedulerPickResponse{Handled: true, AuthID: candidate.ID}
+				}
 			}
 		}
+		if entry.loading == nil {
+			if previous.account.id == "" && now.Before(entry.retryAt) {
+				e.mu.Unlock()
+				return pluginapi.SchedulerPickResponse{}
+			}
+			entry.loading, entry.queued = make(chan struct{}), &req
+			select {
+			case e.wake <- struct{}{}:
+			default:
+			}
+		}
+		loading, done := entry.loading, e.done
+		e.mu.Unlock()
+		if timer == nil {
+			timer = time.NewTimer(e.cfg.RequestTimeout)
+			timeout = timer.C
+		}
+		select {
+		case <-timeout:
+			return pluginapi.SchedulerPickResponse{}
+		case <-done:
+			return pluginapi.SchedulerPickResponse{}
+		case <-loading:
+		}
+		e.mu.Lock()
 	}
-	if previous.account.id == "" && now.Before(entry.retryAt) {
-		return pluginapi.SchedulerPickResponse{}
-	}
-	entry.loading, entry.queued = true, &req
-	select {
-	case e.wake <- struct{}{}:
-	default:
-	}
-	return pluginapi.SchedulerPickResponse{}
 }
 
 func (e *engine) loadSelection(ctx context.Context, req pluginapi.SchedulerPickRequest) selection {

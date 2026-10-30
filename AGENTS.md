@@ -73,3 +73,4 @@ Read the leaf skill in full for any principle you apply. Each entry names when i
 ## Taste
 
 - Do not add comments to Go code.
+- Never publish a new version unless the developer explicitly asks you to do so.

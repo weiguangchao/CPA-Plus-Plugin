@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -61,11 +62,12 @@ func (m *mockCPA) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		status = http.StatusNotFound
 	}
+	releaseQuota, quotaStarted := m.releaseQuota, m.quotaStarted
 	m.mu.Unlock()
-	if quotaRequest && m.releaseQuota != nil {
-		m.startOnce.Do(func() { close(m.quotaStarted) })
+	if quotaRequest && releaseQuota != nil {
+		m.startOnce.Do(func() { close(quotaStarted) })
 		select {
-		case <-m.releaseQuota:
+		case <-releaseQuota:
 		case <-r.Context().Done():
 			return
 		}
@@ -121,25 +123,10 @@ func availableMock() *mockCPA {
 	}}
 }
 
-func awaitPick(t *testing.T, e *engine, req pluginapi.SchedulerPickRequest, want string) {
+func assertPick(t *testing.T, e *engine, req pluginapi.SchedulerPickRequest, want string) {
 	t.Helper()
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	tick := time.NewTicker(time.Millisecond)
-	defer tick.Stop()
-	for {
-		got := e.pick(req)
-		if got.Handled {
-			if got.AuthID != want || got.Reject {
-				t.Fatalf("pick = %+v, want %s", got, want)
-			}
-			return
-		}
-		select {
-		case <-deadline.C:
-			t.Fatalf("timed out waiting for %s", want)
-		case <-tick.C:
-		}
+	if got := e.pick(req); !got.Handled || got.AuthID != want || got.Reject {
+		t.Fatalf("pick = %+v, want %s", got, want)
 	}
 }
 
@@ -157,7 +144,7 @@ func awaitRefresh(t *testing.T, e *engine) {
 		e.mu.Lock()
 		loading := false
 		for _, state := range e.routes {
-			loading = loading || state.loading
+			loading = loading || state.loading != nil
 		}
 		e.mu.Unlock()
 		if !loading {
@@ -175,10 +162,7 @@ func TestDemandLoadingAndStickyTTL(t *testing.T) {
 	e, clock := newTestEngine(t, mock)
 	time.Sleep(20 * time.Millisecond)
 	assertCounts(t, mock, 0, 0)
-	if got := e.pick(pickRequest()); got.Handled || got.Reject {
-		t.Fatal("cold cache must delegate")
-	}
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	assertCounts(t, mock, 1, 2)
 	mock.mu.Lock()
 	mock.quotas["index-a"] = quotaJSON(.5, .5, testNow.Add(10*time.Minute).Format(time.RFC3339), nil)
@@ -192,10 +176,7 @@ func TestDemandLoadingAndStickyTTL(t *testing.T) {
 	assertCounts(t, mock, 1, 2)
 	clock.advance(time.Minute)
 	assertCounts(t, mock, 1, 2)
-	if got := e.pick(pickRequest()); got.Handled {
-		t.Fatal("expired selection must delegate during refresh")
-	}
-	awaitPick(t, e, pickRequest(), "a")
+	assertPick(t, e, pickRequest(), "a")
 	assertCounts(t, mock, 2, 4)
 	other := newEngine(e.cfg)
 	defer other.stop()
@@ -204,18 +185,78 @@ func TestDemandLoadingAndStickyTTL(t *testing.T) {
 	}
 }
 
+func TestFirstPickPrefersAccountWithBothWindows(t *testing.T) {
+	mock := availableMock()
+	mock.quotas["index-a"] = []byte(`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"used_percent":10,"reset_after_seconds":3600}}}`)
+	e, _ := newTestEngine(t, mock)
+	assertPick(t, e, pickRequest(), "b")
+	assertCounts(t, mock, 1, 2)
+}
+
+func TestPinnedRequestsPreserveOrdinarySelection(t *testing.T) {
+	for _, tc := range []struct {
+		name, id string
+		value    any
+	}{
+		{"other account", "a", "a"},
+		{"cached account", "b", "b"},
+		{"trimmed string", "a", " a \n"},
+		{"bytes", "a", []byte("a")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := availableMock()
+			mock.quotas["index-a"] = []byte(`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"used_percent":10,"reset_after_seconds":3600}}}`)
+			e, _ := newTestEngine(t, mock)
+			assertPick(t, e, pickRequest(), "b")
+			req := pickRequest()
+			req.Options.Metadata = map[string]any{"pinned_auth_id": tc.value}
+			req.Candidates = []pluginapi.SchedulerAuthCandidate{{ID: tc.id, Provider: "codex"}}
+			if got := e.pick(req); got.Handled || got.Reject || got.AuthID != "" {
+				t.Fatalf("pinned pick = %+v, want CPA fallback", got)
+			}
+			assertCounts(t, mock, 1, 2)
+			assertPick(t, e, pickRequest(), "b")
+			assertCounts(t, mock, 1, 2)
+		})
+	}
+}
+
+func TestPinnedColdRequestDoesNotDelayOrdinarySelection(t *testing.T) {
+	mock := availableMock()
+	e, _ := newTestEngine(t, mock)
+	req := pickRequest()
+	req.Options.Metadata = map[string]any{"pinned_auth_id": "a"}
+	if got := e.pick(req); got.Handled || got.Reject || got.AuthID != "" {
+		t.Fatalf("pinned cold pick = %+v, want CPA fallback", got)
+	}
+	assertCounts(t, mock, 0, 0)
+	assertPick(t, e, pickRequest(), "b")
+	assertCounts(t, mock, 1, 2)
+}
+
+func TestUnpinnedSingleCandidateStillUsesQuotaScheduling(t *testing.T) {
+	for _, value := range []any{nil, "", " \t\n", []byte{}, []byte(" \n"), 1, true} {
+		t.Run(fmt.Sprintf("%T/%v", value, value), func(t *testing.T) {
+			mock := availableMock()
+			e, _ := newTestEngine(t, mock)
+			req := pickRequest()
+			req.Options.Metadata = map[string]any{"pinned_auth_id": value}
+			req.Candidates = req.Candidates[:1]
+			assertPick(t, e, req, "a")
+			assertCounts(t, mock, 1, 1)
+		})
+	}
+}
+
 func TestCandidateRemovalRefreshesOnlyRemainingAccounts(t *testing.T) {
 	mock := availableMock()
 	e, _ := newTestEngine(t, mock)
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	req := pickRequest()
 	req.Candidates = req.Candidates[:1]
-	if got := e.pick(req); got.Handled {
-		t.Fatal("removed account or old quota reused")
-	}
-	awaitPick(t, e, req, "a")
+	assertPick(t, e, req, "a")
 	assertCounts(t, mock, 2, 3)
-	awaitPick(t, e, pickRequest(), "a")
+	assertPick(t, e, pickRequest(), "a")
 	assertCounts(t, mock, 2, 3)
 }
 
@@ -223,18 +264,18 @@ func TestModelAndProviderRouteCachesAreIndependent(t *testing.T) {
 	mock := availableMock()
 	mock.quotas["index-b"] = []byte(`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":50,"reset_at":"2026-10-29T13:00:00Z"},"secondary_window":{"limit_window_seconds":604800,"used_percent":50}},"additional_rate_limits":[{"limit_name":"gpt-5.3-codex-spark","rate_limit":{"secondary_window":{"limit_window_seconds":604800,"used_percent":100,"reset_at":"2026-10-29T12:00:05Z"}}}]}`)
 	e, clock := newTestEngine(t, mock)
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	spark := pickRequest()
 	spark.Model = "gpt-5.3-codex-spark"
-	awaitPick(t, e, spark, "a")
+	assertPick(t, e, spark, "a")
 	clock.advance(5 * time.Second)
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	assertCounts(t, mock, 2, 4)
 	mixed := pickRequest()
 	mixed.Provider, mixed.Providers = "mixed", []string{"codex", "claude"}
-	awaitPick(t, e, mixed, "b")
+	assertPick(t, e, mixed, "b")
 	mixed.Providers = []string{"claude", "codex"}
-	awaitPick(t, e, mixed, "b")
+	assertPick(t, e, mixed, "b")
 	assertCounts(t, mock, 3, 6)
 }
 
@@ -252,17 +293,14 @@ func TestKnownResetEndsStickinessOnNextRequest(t *testing.T) {
 				mock.quotas["index-a"] = quotaJSON(0, .5, reset, nil)
 			}
 			e, clock := newTestEngine(t, mock)
-			awaitPick(t, e, pickRequest(), "b")
+			assertPick(t, e, pickRequest(), "b")
 			clock.advance(5 * time.Second)
 			mock.mu.Lock()
 			mock.quotas["index-a"] = quotaJSON(.5, .5, testNow.Add(time.Minute).Format(time.RFC3339), nil)
 			mock.quotas["index-b"] = quotaJSON(.5, .5, testNow.Add(time.Hour).Format(time.RFC3339), nil)
 			mock.mu.Unlock()
 			assertCounts(t, mock, 1, 2)
-			if got := e.pick(pickRequest()); got.Handled {
-				t.Fatal("reset account reused without a new observation")
-			}
-			awaitPick(t, e, pickRequest(), "a")
+			assertPick(t, e, pickRequest(), "a")
 			assertCounts(t, mock, 2, 4)
 		})
 	}
@@ -273,34 +311,47 @@ func TestConcurrentMissesShareOneRefreshAndHitsStaySticky(t *testing.T) {
 	mock := availableMock()
 	mock.quotaStarted, mock.releaseQuota = make(chan struct{}), release
 	e, _ := newTestEngine(t, mock)
-	e.pick(pickRequest())
+	results := make(chan pluginapi.SchedulerPickResponse, 33)
+	go func() { results <- e.pick(pickRequest()) }()
 	select {
 	case <-mock.quotaStarted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("quota query did not start")
 	}
-	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 20; j++ {
-				if got := e.pick(pickRequest()); got.Handled || got.Reject {
-					t.Errorf("pending refresh must delegate: %+v", got)
-					return
-				}
-			}
-		}()
-	}
-	finished := make(chan struct{})
-	go func() { wg.Wait(); close(finished) }()
+	pinned := pickRequest()
+	pinned.Options.Metadata = map[string]any{"pinned_auth_id": "a"}
+	pinned.Candidates = pinned.Candidates[:1]
+	pinnedResult := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { pinnedResult <- e.pick(pinned) }()
 	select {
-	case <-finished:
-	case <-time.After(5 * time.Second):
-		t.Fatal("scheduler waited for network")
+	case got := <-pinnedResult:
+		if got.Handled || got.Reject || got.AuthID != "" {
+			t.Fatalf("pinned pick during refresh = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pinned request waited for ordinary refresh")
+	}
+	assertCounts(t, mock, 1, 1)
+	for i := 0; i < 32; i++ {
+		go func() { results <- e.pick(pickRequest()) }()
+	}
+	select {
+	case got := <-results:
+		t.Fatalf("scheduler returned before quota query completed: %+v", got)
+	case <-time.After(30 * time.Millisecond):
 	}
 	close(release)
-	awaitPick(t, e, pickRequest(), "b")
+	for i := 0; i < 33; i++ {
+		select {
+		case got := <-results:
+			if !got.Handled || got.AuthID != "b" || got.Reject {
+				t.Fatalf("first pick = %+v, want b", got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("refresh did not wake all waiting requests")
+		}
+	}
+	var wg sync.WaitGroup
 	for i := 0; i < 32; i++ {
 		wg.Add(1)
 		go func() {
@@ -314,12 +365,69 @@ func TestConcurrentMissesShareOneRefreshAndHitsStaySticky(t *testing.T) {
 	assertCounts(t, mock, 1, 2)
 }
 
+func TestWaitTimeoutIncludesQueueAndDoesNotBlockCacheHits(t *testing.T) {
+	mock := availableMock()
+	e, _ := newTestEngine(t, mock)
+	e.cfg.RequestTimeout = 150 * time.Millisecond
+	assertPick(t, e, pickRequest(), "b")
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+	mock.mu.Lock()
+	mock.quotaStarted, mock.releaseQuota = make(chan struct{}), release
+	started := mock.quotaStarted
+	mock.mu.Unlock()
+	slow := pickRequest()
+	slow.Model = "slow-model"
+	results := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { results <- e.pick(slow) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("quota query did not start")
+	}
+	hit := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { hit <- e.pick(pickRequest()) }()
+	select {
+	case got := <-hit:
+		if !got.Handled || got.AuthID != "b" {
+			t.Fatalf("cached route = %+v, want b", got)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("cache hit blocked behind another route's query")
+	}
+	queued := pickRequest()
+	queued.Model = "queued-model"
+	before := time.Now()
+	if got := e.pick(queued); got.Handled || got.Reject || got.AuthID != "" {
+		t.Fatalf("queued timeout = %+v, want CPA fallback", got)
+	}
+	if elapsed := time.Since(before); elapsed < 100*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("queued wait = %s, want bounded wait near 150ms", elapsed)
+	}
+	select {
+	case got := <-results:
+		if got.Handled || got.Reject || got.AuthID != "" {
+			t.Fatalf("query timeout = %+v, want CPA fallback", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active query exceeded scheduler wait limit")
+	}
+	assertCounts(t, mock, 2, 3)
+	releaseAll()
+	assertPick(t, e, slow, "b")
+	assertPick(t, e, queued, "b")
+	assertCounts(t, mock, 3, 6)
+}
+
 func TestInFlightResultMustStillMatchCurrentCandidates(t *testing.T) {
 	release := make(chan struct{})
 	mock := availableMock()
 	mock.quotaStarted, mock.releaseQuota = make(chan struct{}), release
 	e, _ := newTestEngine(t, mock)
-	e.pick(pickRequest())
+	fullResult := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { fullResult <- e.pick(pickRequest()) }()
 	select {
 	case <-mock.quotaStarted:
 	case <-time.After(5 * time.Second):
@@ -327,11 +435,25 @@ func TestInFlightResultMustStillMatchCurrentCandidates(t *testing.T) {
 	}
 	onlyA := pickRequest()
 	onlyA.Candidates = onlyA.Candidates[:1]
-	if got := e.pick(onlyA); got.Handled {
-		t.Fatal("in-flight selection escaped candidate check")
-	}
+	restrictedResult := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { restrictedResult <- e.pick(onlyA) }()
 	close(release)
-	awaitPick(t, e, onlyA, "a")
+	select {
+	case got := <-restrictedResult:
+		if !got.Handled || got.AuthID != "a" || got.Reject {
+			t.Fatalf("restricted pick = %+v, want a", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("candidate change did not finish reselection")
+	}
+	select {
+	case got := <-fullResult:
+		if !got.Handled || (got.AuthID != "a" && got.AuthID != "b") || got.Reject {
+			t.Fatalf("full pick = %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial request did not finish")
+	}
 	assertCounts(t, mock, 2, 3)
 }
 
@@ -340,7 +462,7 @@ func TestFailedSelectionThrottlesUntilRequestAfterRetryDeadline(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			mock := availableMock()
 			e, clock := newTestEngine(t, mock)
-			awaitPick(t, e, pickRequest(), "b")
+			assertPick(t, e, pickRequest(), "b")
 			mock.mu.Lock()
 			switch failure {
 			case "list":
@@ -371,7 +493,7 @@ func TestFailedSelectionThrottlesUntilRequestAfterRetryDeadline(t *testing.T) {
 			mock.mu.Unlock()
 			clock.advance(e.cfg.RetryInterval)
 			assertCounts(t, mock, lists, quotas)
-			awaitPick(t, e, pickRequest(), "b")
+			assertPick(t, e, pickRequest(), "b")
 			assertCounts(t, mock, lists+1, quotas+2)
 		})
 	}
@@ -403,7 +525,7 @@ func TestShortCacheTTLDoesNotBypassFailedQueryRetryDelay(t *testing.T) {
 			mock.quotas = availableMock().quotas
 			mock.mu.Unlock()
 			clock.advance(28 * time.Second)
-			awaitPick(t, e, pickRequest(), "b")
+			assertPick(t, e, pickRequest(), "b")
 			assertCounts(t, mock, 2, initialQuotas+2)
 		})
 	}
@@ -420,7 +542,7 @@ func TestKnownResetCanShortenUnsuccessfulSelectionRetry(t *testing.T) {
 	mock.mu.Lock()
 	mock.quotas = availableMock().quotas
 	mock.mu.Unlock()
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	assertCounts(t, mock, 2, 4)
 }
 
@@ -429,7 +551,8 @@ func TestSlowRefreshCannotPublishPastItsCacheDeadline(t *testing.T) {
 	mock := availableMock()
 	mock.quotaStarted, mock.releaseQuota = make(chan struct{}), release
 	e, clock := newTestEngine(t, mock)
-	e.pick(pickRequest())
+	result := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { result <- e.pick(pickRequest()) }()
 	select {
 	case <-mock.quotaStarted:
 	case <-time.After(5 * time.Second):
@@ -437,6 +560,14 @@ func TestSlowRefreshCannotPublishPastItsCacheDeadline(t *testing.T) {
 	}
 	clock.advance(e.cfg.CacheTTL)
 	close(release)
+	select {
+	case got := <-result:
+		if got.Handled || got.Reject {
+			t.Fatalf("late first pick = %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late response did not wake waiting request")
+	}
 	awaitRefresh(t, e)
 	if got := e.pick(pickRequest()); got.Handled {
 		t.Fatal("late response extended the cache deadline")
@@ -444,7 +575,7 @@ func TestSlowRefreshCannotPublishPastItsCacheDeadline(t *testing.T) {
 	awaitRefresh(t, e)
 	assertCounts(t, mock, 1, 1)
 	clock.advance(e.cfg.RetryInterval)
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	assertCounts(t, mock, 2, 3)
 }
 
@@ -452,12 +583,12 @@ func TestTieRotationOccursOnlyOnReselection(t *testing.T) {
 	mock := availableMock()
 	mock.quotas["index-a"] = mock.quotas["index-b"]
 	e, clock := newTestEngine(t, mock)
-	awaitPick(t, e, pickRequest(), "a")
+	assertPick(t, e, pickRequest(), "a")
 	for i := 0; i < 10; i++ {
-		awaitPick(t, e, pickRequest(), "a")
+		assertPick(t, e, pickRequest(), "a")
 	}
 	clock.advance(e.cfg.CacheTTL)
-	awaitPick(t, e, pickRequest(), "b")
+	assertPick(t, e, pickRequest(), "b")
 	assertCounts(t, mock, 2, 4)
 }
 
@@ -488,7 +619,8 @@ func TestStopCancelsManagementRequest(t *testing.T) {
 	e := newEngine(cfg)
 	e.start()
 	defer e.stop()
-	e.pick(pickRequest())
+	result := make(chan pluginapi.SchedulerPickResponse, 1)
+	go func() { result <- e.pick(pickRequest()) }()
 	select {
 	case <-started:
 	case <-time.After(5 * time.Second):
@@ -500,6 +632,14 @@ func TestStopCancelsManagementRequest(t *testing.T) {
 	case <-stopped:
 	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown did not cancel pending API request")
+	}
+	select {
+	case got := <-result:
+		if got.Handled || got.Reject {
+			t.Fatalf("stopped pending pick = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not wake waiting scheduler")
 	}
 	if got := e.pick(pickRequest()); got.Handled {
 		t.Fatal("stopped plugin handled a request")
@@ -578,7 +718,7 @@ func TestConfigValidation(t *testing.T) {
 	}
 	for _, raw := range []string{
 		"cpa_url: file:///tmp/cpa", "cpa_url: http://user:secret@localhost:8317",
-		"cache_ttl: 0s", "retry_interval: 0s", "request_timeout: 0s", "providers: []", "providers: [unsupported]",
+		"cache_ttl: 0s", "retry_interval: 0s", "request_timeout: 0s",
 	} {
 		if _, err := parseConfig([]byte(valid + raw)); err == nil {
 			t.Errorf("invalid configuration accepted: %s", raw)
@@ -611,5 +751,21 @@ func TestEmptyManagementKeyDelegatesWithoutQueries(t *testing.T) {
 		}
 		e.stop()
 		assertCounts(t, mock, 0, 0)
+	}
+}
+
+func TestAllSupportedProvidersEnabledWithoutConfiguration(t *testing.T) {
+	for _, provider := range []string{"claude", "anthropic", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			mock := availableMock()
+			mock.credentials = []credential{{ID: "a", Index: "index-a", Provider: provider}}
+			if provider != "codex" {
+				mock.quotas["index-a"] = []byte(`{"five_hour":{"utilization":50,"resets_at":"2026-10-29T13:00:00Z"},"seven_day":{"utilization":20}}`)
+			}
+			e, _ := newTestEngine(t, mock, "providers: []")
+			req := pluginapi.SchedulerPickRequest{Provider: provider, Model: "model", Candidates: []pluginapi.SchedulerAuthCandidate{{ID: "a", Provider: provider}}}
+			assertPick(t, e, req, "a")
+			assertCounts(t, mock, 1, 1)
+		})
 	}
 }
