@@ -9,8 +9,7 @@ plugins:
       priority: 100
       cpa_url: "http://127.0.0.1:8317"
       management_key: ""
-      providers: ["claude", "codex"]
       # No periodic polling. Requests trigger refresh after invalidation.
       cache_ttl: "5m"
-      retry_interval: "20s"
       request_timeout: "10s"
+      retry_interval: "20s"

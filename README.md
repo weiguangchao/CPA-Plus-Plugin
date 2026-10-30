@@ -9,7 +9,7 @@ leaves scheduling to CPA.
 
 [中文说明与配置](README_CN.md)
 
-Versions use the `0.1.x` series. The current version is `0.1.5`; the root `VERSION`
+Versions use the `0.1.x` series. The current version is `0.1.6`; the root `VERSION`
 file supplies both plugin registration metadata and package filenames. Make
 injects the version at build time, so the library does not read this file at
 runtime. Direct Go builds without the version linker flag report `dev`.
@@ -31,9 +31,14 @@ Quota results live in memory only. No quota provider plugin is required. The
 plugin lists credentials through CPA and uses
 `POST /v8/management/requests/api-call` to have CPA query upstream usage APIs.
 CPA sends the upstream requests; this plugin parses quota and reset fields.
-Supported providers are `claude`, `anthropic` and `codex`, with `claude` and
-`codex` enabled by default. These usage endpoints require compatible OAuth
+All current adapters are enabled by default: `claude`, `anthropic` and `codex`.
+The `providers` setting has been removed. Other providers delegate to CPA. These usage endpoints require compatible OAuth
 credentials; API keys may fail and delegate to CPA.
+
+The plugin form exposes five fields in this order: `cpa_url`, `management_key`,
+`cache_ttl`, `request_timeout`, `retry_interval`. Configuration keys retain these
+names and their descriptions are in Chinese. The old `providers` setting no
+longer restricts account selection.
 
 Build with Go 1.26.10 or later, CGO enabled, and a C compiler:
 
@@ -63,7 +68,7 @@ python3 scripts/smoke.py build/linux-amd64/cpa-plus.so
 ```
 
 The library is `build/linux-amd64/cpa-plus.so`. The package and SHA-256 checksum
-are `dist/cpa-plus_0.1.5_linux_amd64.tar.gz` and the adjacent `.sha256` file. The
+are `dist/cpa-plus_0.1.6_linux_amd64.tar.gz` and the adjacent `.sha256` file. The
 archive includes the library, version, example config, both READMEs and LICENSE.
 
 For cross-compilation, put Zig in `PATH` and run the same Make target. It defaults
@@ -85,16 +90,24 @@ process. Home mode bypasses local scheduler plugins. Only the highest-priority
 active scheduler plugin runs. Direct plugin selections bypass CPA's built-in
 session affinity. Default fallback is unrestricted by this plugin's quota filter.
 
+Requests with a nonempty `Options.Metadata.pinned_auth_id` delegate directly to
+CPA. They make no management API calls and do not read or update the ordinary
+selection cache, so a pinned connection cannot overwrite another connection's
+preferred account. A single candidate without a valid pin still uses quota
+scheduling. The plugin does not unpin or migrate existing connections.
+
 The plugin never disables credentials, clears cooldowns, resets upstream quotas,
-or persists quota data. Cold caches, expired results, unsupported windows and
-API failures without a valid cached result all delegate to CPA. Every refresh
+or persists quota data. Unsupported windows, unsuccessful lookups and scheduling
+wait timeouts delegate to CPA. Every refresh
 sends a new usage request through CPA. Concurrent clients can consume quota
 between observations.
 
 There is no periodic polling or startup query. The first scheduling request with
 supported candidates queues one background refresh: list CPA credentials, then
-fetch quota and reset times only for matching candidates. Cold or refreshing
-routes delegate to CPA without waiting for network requests.
+fetch quota and reset times only for matching candidates. A request without a
+valid cached selection waits up to `request_timeout`, normally 10 seconds,
+including queue time. If a suitable account is found within this limit, the
+same request uses it. Otherwise the request delegates to CPA.
 
 Later requests reuse the selected account until it leaves CPA's candidates, the
 five-minute `cache_ttl` expires, or a known relevant reset time arrives, whichever
@@ -104,7 +117,10 @@ idle plugins issue no API calls. Cache hits do not extend the deadline, and new
 candidates do not preempt a still-valid selection. Tied accounts rotate only on
 reselection.
 
-Concurrent misses for a route share one refresh. All routes use one API worker,
+Concurrent misses for a route share one refresh, with a separate wait deadline
+for each request. Waiting does not hold the cache lock or block valid cache hits.
+After a wait timeout, the background refresh continues and can populate the
+cache for later requests. All routes use one API worker,
 which queries accounts sequentially. Failed or unsuccessful selections delegate
 to CPA and wait at least `retry_interval`, normally 20 seconds, before a later
 request can retry. A known earlier reset can shorten that wait. Individual API
@@ -164,10 +180,15 @@ apply. The plugin's own `priority` remains a CPA setting, and valid cached
 selections remain sticky. Remove the old `schedule_across_priorities` setting;
 it no longer controls this behavior, including when set to `false`.
 
-`request_timeout` defaults to `10s` per background management API request,
-including credential listing, usage forwarding and SIWC downloads. It is not
-an inference timeout or the total refresh deadline. Sequential account queries
-can take longer than this limit; scheduling does not wait for them.
+`request_timeout` defaults to `10s`. It limits each background management API
+request, including credential listing, usage forwarding and SIWC downloads.
+It also limits how long a scheduling request without a valid cached selection
+waits for a result, including queue time and any reselection needed to match
+its candidates. This wait deadline does not restart after a refresh completes.
+A wait timeout delegates the current request to CPA while the refresh continues.
+Sequential account queries can take longer than this limit in total. This
+setting does not limit inference execution time. Plugin shutdown cancels the
+refresh and wakes waiting scheduling requests.
 
 `retry_interval` defaults to `20s` after an unsuccessful refresh completes.
 Once the delay expires, a new scheduling request can trigger another refresh.
@@ -180,11 +201,11 @@ GitHub Actions checks and builds Linux amd64 on pushes to `main` and pull
 requests. Pushing a `v0.1.x` tag also publishes a GitHub release after the checks
 pass. The tag must match the root `VERSION` exactly, prefixed with `v`.
 
-For example, when `VERSION` contains `0.1.5`, run:
+For example, when `VERSION` contains `0.1.6`, run:
 
 ```sh
-git tag v0.1.5
-git push origin v0.1.5
+git tag v0.1.6
+git push origin v0.1.6
 ```
 
 For the next release, update `VERSION`, commit and push the changes before

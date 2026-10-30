@@ -136,6 +136,10 @@ def abi_smoke(library, fixture, url):
     week = (now + datetime.timedelta(days=4)).isoformat()
     cases = [
         ("five-hour ordering", quota(.5, .5, later, week), quota(.5, .5, soon, week), "b"),
+        ("first pick skips weekly-only account",
+         {"rate_limit": {"primary_window": {"limit_window_seconds": 604800,
+                                             "used_percent": 10, "reset_at": soon}}},
+         quota(.5, .5, later, week), "b"),
         ("weekly exhaustion filter", quota(.5, .5, later, week), quota(.5, 0, soon, week), "a"),
         ("weekly fallback", quota(.5, .5, None, soon), quota(.5, .5, None, later), "a"),
         ("no reset delegates", quota(.5, .5), quota(.5, .5), ""),
@@ -145,6 +149,11 @@ def abi_smoke(library, fixture, url):
         blank = {"config_yaml": base64.b64encode(f"cpa_url: {url}\n".encode()).decode()}
         initial = call("plugin.register", blank)
         fields = {field["Name"] for field in initial["metadata"]["ConfigFields"]}
+        assert [field["Name"] for field in initial["metadata"]["ConfigFields"]] == [
+            "cpa_url", "management_key", "cache_ttl", "request_timeout", "retry_interval",
+        ], "unexpected form field order"
+        assert all(any("\u4e00" <= char <= "\u9fff" for char in field["Description"])
+                   for field in initial["metadata"]["ConfigFields"]), "field descriptions must be Chinese"
         assert "management_key" in fields, "form is missing direct management key input"
         assert "management_key_env" not in fields and "model_aliases" not in fields, fields
         assert "schedule_across_priorities" not in fields, fields
@@ -171,8 +180,19 @@ def abi_smoke(library, fixture, url):
             assert result["metadata"]["Version"] == expected_version, "plugin version differs from VERSION"
             with fixture.condition:
                 assert fixture.queries == before, "plugin startup must not query quotas"
+                cold_counts = (fixture.lists, fixture.queries)
+            pinned_a = {**request, "Options": {"Metadata": {"pinned_auth_id": "a"}},
+                        "Candidates": request["Candidates"][:1]}
+            pinned_pick = call("scheduler.pick", pinned_a)
+            assert not pinned_pick.get("Handled") and not pinned_pick.get("Reject") and not pinned_pick.get("AuthID"), pinned_pick
+            with fixture.condition:
+                assert (fixture.lists, fixture.queries) == cold_counts, "cold pinned request called API"
             first_pick = call("scheduler.pick", request)
-            assert not first_pick.get("Handled") and not first_pick.get("Reject"), first_pick
+            assert not first_pick.get("Reject"), first_pick
+            if expected:
+                assert first_pick.get("Handled") and first_pick.get("AuthID") == expected, first_pick
+            else:
+                assert not first_pick.get("Handled") and not first_pick.get("AuthID"), first_pick
             with fixture.condition:
                 assert fixture.condition.wait_for(lambda: fixture.queries >= before + 2, 10), name
 
@@ -195,8 +215,18 @@ def abi_smoke(library, fixture, url):
                 with fixture.condition:
                     assert (fixture.lists, fixture.queries) == counts, "cache hit called API"
                 print("PASS native ABI: sticky cache hits issue no API calls")
+                for candidate in request["Candidates"]:
+                    pinned = {**request, "Options": {"Metadata": {"pinned_auth_id": candidate["ID"]}},
+                              "Candidates": [candidate]}
+                    pinned_pick = call("scheduler.pick", pinned)
+                    assert not pinned_pick.get("Handled") and not pinned_pick.get("Reject") and not pinned_pick.get("AuthID"), pinned_pick
+                assert call("scheduler.pick", request).get("AuthID") == "b", "pinned request replaced ordinary selection"
+                with fixture.condition:
+                    assert (fixture.lists, fixture.queries) == counts, "pinned request called API"
+                print("PASS native ABI: pinned requests delegate without changing ordinary cache")
                 only_a = {**request, "Candidates": request["Candidates"][:1]}
-                assert not call("scheduler.pick", only_a).get("Handled"), "candidate removal did not refresh"
+                refreshed = call("scheduler.pick", only_a)
+                assert refreshed.get("Handled") and refreshed.get("AuthID") == "a", refreshed
 
                 def selected_a():
                     pick = call("scheduler.pick", only_a)
