@@ -150,8 +150,10 @@ def abi_smoke(library, fixture, url):
         initial = call("plugin.register", blank)
         fields = {field["Name"] for field in initial["metadata"]["ConfigFields"]}
         assert [field["Name"] for field in initial["metadata"]["ConfigFields"]] == [
-            "cpa_url", "management_key", "cache_ttl", "request_timeout", "retry_interval",
+            "cpa_url", "management_key", "request_timeout", "retry_interval", "cache_ttl",
         ], "unexpected form field order"
+        assert next(field for field in initial["metadata"]["ConfigFields"]
+                    if field["Name"] == "cache_ttl")["Default"] == "10m", "cache_ttl must default to 10m"
         assert all(any("\u4e00" <= char <= "\u9fff" for char in field["Description"])
                    for field in initial["metadata"]["ConfigFields"]), "field descriptions must be Chinese"
         assert "management_key" in fields, "form is missing direct management key input"
@@ -161,6 +163,7 @@ def abi_smoke(library, fixture, url):
         legacy = {"config_yaml": base64.b64encode((config + "schedule_across_priorities: false\n").encode()).decode()}
         updated = call("plugin.reconfigure", legacy)
         assert updated["capabilities"]["scheduler_across_priorities"] is True, "legacy setting disabled cross-priority scheduling"
+        call("plugin.reconfigure", {"config_yaml": base64.b64encode((config + "cache_ttl: 0\n").encode()).decode()})
         call("plugin.reconfigure", blank)
         print("PASS native ABI: cross-priority scheduling always enabled; form option removed")
         assert fixture.key not in json.dumps(initial), "registration metadata exposed the management key"

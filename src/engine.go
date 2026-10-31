@@ -29,7 +29,6 @@ type selection struct {
 
 type routeCache struct {
 	selection selection
-	lastUsed  time.Time
 	retryAt   time.Time
 	loading   chan struct{}
 	queued    *pluginapi.SchedulerPickRequest
@@ -156,31 +155,23 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	now := e.now()
 	if !now.Before(e.nextPrune) {
 		for route, entry := range e.routes {
-			if entry.loading == nil && !now.Before(entry.retryAt) && now.Sub(entry.lastUsed) >= e.cfg.CacheTTL {
+			if entry.loading == nil && !now.Before(entry.retryAt) && !now.Before(entry.selection.validUntil) {
 				delete(e.routes, route)
 			}
 		}
-		e.nextPrune = now.Add(e.cfg.CacheTTL)
+		e.nextPrune = now.Add(time.Minute)
 	}
 	entry := e.routes[key]
 	if entry == nil {
 		entry = &routeCache{}
 		e.routes[key] = entry
 	}
-	var timer *time.Timer
-	var timeout <-chan time.Time
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
 	for {
 		if e.stopped {
 			e.mu.Unlock()
 			return pluginapi.SchedulerPickResponse{}
 		}
 		now = e.now()
-		entry.lastUsed = now
 		previous := entry.selection
 		if previous.account.id != "" && !now.Before(previous.loadedAt) && now.Before(previous.validUntil) {
 			for _, candidate := range candidates {
@@ -203,13 +194,7 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 		}
 		loading, done := entry.loading, e.done
 		e.mu.Unlock()
-		if timer == nil {
-			timer = time.NewTimer(e.cfg.RequestTimeout)
-			timeout = timer.C
-		}
 		select {
-		case <-timeout:
-			return pluginapi.SchedulerPickResponse{}
 		case <-done:
 			return pluginapi.SchedulerPickResponse{}
 		case <-loading:
@@ -229,9 +214,12 @@ func (e *engine) loadSelection(ctx context.Context, req pluginapi.SchedulerPickR
 		requested[accountKey{authID(c.ID), c.Provider}] = true
 	}
 	quotas := make(map[authID]quotaSnapshot, len(requested))
-	result := selection{loadedAt: started, validUntil: started.Add(e.cfg.CacheTTL)}
+	result := selection{loadedAt: started}
+	if e.cfg.CacheTTL > 0 {
+		result.validUntil = started.Add(e.cfg.CacheTTL)
+	}
 	for _, c := range credentials {
-		if ctx.Err() != nil || !e.now().Before(result.validUntil) {
+		if ctx.Err() != nil || (!result.validUntil.IsZero() && !e.now().Before(result.validUntil)) {
 			return selection{}
 		}
 		if !requested[accountKey{c.ID, c.Provider}] || c.Disabled || c.Index == "" {
@@ -247,12 +235,12 @@ func (e *engine) loadSelection(ctx context.Context, req pluginapi.SchedulerPickR
 			if result.nextReset.IsZero() || reset.Before(result.nextReset) {
 				result.nextReset = reset
 			}
-			if reset.Before(result.validUntil) {
+			if result.validUntil.IsZero() || reset.Before(result.validUntil) {
 				result.validUntil = reset
 			}
 		}
 	}
-	if !e.now().Before(result.validUntil) {
+	if !result.validUntil.IsZero() && !e.now().Before(result.validUntil) {
 		return selection{}
 	}
 	winners := rankedAccounts(req, quotas, e.now(), e.cfg.CacheTTL)
