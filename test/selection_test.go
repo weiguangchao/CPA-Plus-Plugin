@@ -64,6 +64,12 @@ func TestQuotaExpiryAndHostCandidates(t *testing.T) {
 	if got := rankedAccounts(req, quotas, testNow.Add(time.Minute), time.Minute); len(got) != 0 {
 		t.Fatalf("stale quota selected %v", got)
 	}
+	if got := rankedAccounts(req, quotas, testNow.Add(30*time.Minute), 0); !reflect.DeepEqual(got, []string{"a"}) {
+		t.Fatalf("unlimited quota selected %v, want a", got)
+	}
+	if got := rankedAccounts(req, quotas, testNow.Add(time.Hour), 0); len(got) != 0 {
+		t.Fatalf("unlimited quota reused past reset: %v", got)
+	}
 	delete(quotas, "a")
 	if got := rankedAccounts(req, quotas, testNow, time.Minute); len(got) != 0 {
 		t.Fatalf("selected account outside host candidates: %v", got)

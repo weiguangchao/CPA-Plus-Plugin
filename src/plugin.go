@@ -99,9 +99,9 @@ func registration() any {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "cpa_url", Type: pluginapi.ConfigFieldTypeString, Default: "http://127.0.0.1:8317", Description: "CPA 服务地址，可包含部署子路径，无需填写 /v8/management。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "直接填写 CPA 管理密钥。留空时不查询额度，调度交回 CPA。"},
-				{Name: "cache_ttl", Type: pluginapi.ConfigFieldTypeString, Default: "5m", Description: "已选账号缓存的最长有效期。到期后由新请求触发刷新；到达已知额度重置时间时可提前失效。默认 5m，即 5 分钟。"},
-				{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "10s", Description: "每次 CPA 管理 API 请求的超时时间，也是调度在无有效缓存时等待查询结果的上限，包含排队时间。默认 10s，即 10 秒。等待超时后交回 CPA，后台查询继续；不限制推理执行时间。"},
+				{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "10s", Description: "每次 CPA 管理 API 请求的超时时间，默认 10s，即 10 秒。适用于账号列表、额度转发和 SIWC 凭据下载。调度请求等待查询结果没有固定超时；此项不限制排队、整轮查询或推理执行时间。"},
 				{Name: "retry_interval", Type: pluginapi.ConfigFieldTypeString, Default: "20s", Description: "查询失败或未选出账号后，允许新请求再次查询前的等待时间。默认 20s，即 20 秒；已知重置时间更早时可提前重试，没有请求时不重试。"},
+				{Name: "cache_ttl", Type: pluginapi.ConfigFieldTypeString, Default: "10m", Description: "已选账号缓存的最长有效期，默认 10m，即 10 分钟。填写 0 表示不按固定时长过期，也可填写其他至少 1 秒的时长。到达已知额度重置时间或已选账号退出候选时，仍由新请求触发刷新。"},
 			},
 		},
 		Capabilities: struct {

@@ -23,11 +23,23 @@ type config struct {
 func parseConfig(raw []byte) (config, error) {
 	cfg := config{
 		CPAURL:        "http://127.0.0.1:8317",
-		CacheTTL:      5 * time.Minute,
+		CacheTTL:      10 * time.Minute,
 		RetryInterval: 20 * time.Second, RequestTimeout: 10 * time.Second,
 	}
 	if len(bytes.TrimSpace(raw)) > 0 {
-		if err := yaml.NewDecoder(bytes.NewReader(raw)).Decode(&cfg); err != nil {
+		var document yaml.Node
+		if err := yaml.NewDecoder(bytes.NewReader(raw)).Decode(&document); err != nil {
+			return config{}, fmt.Errorf("decode plugin configuration: %w", err)
+		}
+		if len(document.Content) > 0 && document.Content[0].Kind == yaml.MappingNode {
+			fields := document.Content[0].Content
+			for i := 0; i < len(fields); i += 2 {
+				if fields[i].Value == "cache_ttl" && fields[i+1].Tag == "!!int" && fields[i+1].Value == "0" {
+					fields[i+1].Tag = "!!str"
+				}
+			}
+		}
+		if err := document.Decode(&cfg); err != nil {
 			return config{}, fmt.Errorf("decode plugin configuration: %w", err)
 		}
 	}
@@ -36,8 +48,11 @@ func parseConfig(raw []byte) (config, error) {
 		return config{}, fmt.Errorf("cpa_url must be an HTTP(S) URL without credentials, query or fragment")
 	}
 	cfg.CPAURL = strings.TrimRight(u.String(), "/")
-	if cfg.RetryInterval < time.Second || cfg.RequestTimeout < time.Second || cfg.CacheTTL < time.Second {
-		return config{}, fmt.Errorf("cache_ttl, retry_interval and request_timeout must be at least 1s")
+	if cfg.CacheTTL != 0 && cfg.CacheTTL < time.Second {
+		return config{}, fmt.Errorf("cache_ttl must be 0 or at least 1s")
+	}
+	if cfg.RetryInterval < time.Second || cfg.RequestTimeout < time.Second {
+		return config{}, fmt.Errorf("retry_interval and request_timeout must be at least 1s")
 	}
 	if strings.ContainsAny(cfg.ManagementKey, "\r\n") {
 		return config{}, fmt.Errorf("management_key must not contain line breaks")

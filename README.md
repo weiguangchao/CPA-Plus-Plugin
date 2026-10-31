@@ -36,7 +36,7 @@ The `providers` setting has been removed. Other providers delegate to CPA. These
 credentials; API keys may fail and delegate to CPA.
 
 The plugin form exposes five fields in this order: `cpa_url`, `management_key`,
-`cache_ttl`, `request_timeout`, `retry_interval`. Configuration keys retain these
+`request_timeout`, `retry_interval`, `cache_ttl`. Configuration keys retain these
 names and their descriptions are in Chinese. The old `providers` setting no
 longer restricts account selection.
 
@@ -97,30 +97,33 @@ preferred account. A single candidate without a valid pin still uses quota
 scheduling. The plugin does not unpin or migrate existing connections.
 
 The plugin never disables credentials, clears cooldowns, resets upstream quotas,
-or persists quota data. Unsupported windows, unsuccessful lookups and scheduling
-wait timeouts delegate to CPA. Every refresh
-sends a new usage request through CPA. Concurrent clients can consume quota
+or persists quota data. Unsupported windows and unsuccessful lookups delegate
+to CPA. Every refresh sends a new usage request through CPA. Concurrent clients can consume quota
 between observations.
 
 There is no periodic polling or startup query. The first scheduling request with
 supported candidates queues one background refresh: list CPA credentials, then
 fetch quota and reset times only for matching candidates. A request without a
-valid cached selection waits up to `request_timeout`, normally 10 seconds,
-including queue time. If a suitable account is found within this limit, the
-same request uses it. Otherwise the request delegates to CPA.
+valid cached selection waits for the refresh without a fixed scheduling timeout,
+including queue time. If a suitable account is found, the same request uses it.
+If no account is selected or the plugin stops, the request delegates to CPA.
 
-Later requests reuse the selected account until it leaves CPA's candidates, the
-five-minute `cache_ttl` expires, or a known relevant reset time arrives, whichever
-happens first. Resets from other queried candidates also end the cache, since
+Later requests reuse the selected account until it leaves CPA's candidates, a
+configured positive `cache_ttl` expires, or a known relevant reset time arrives,
+whichever happens first. The default `cache_ttl` is `10m`, or ten minutes. Set it
+to `0` to disable fixed-age expiration. YAML accepts `cache_ttl: 0`, `"0"`, or
+`"0s"`; a positive duration such as `5m` must be at least one second. Negative and nonzero subsecond values are
+rejected. Positive TTLs start when the refresh begins. Resets still end the cache
+when `cache_ttl` is `0`. Resets from other queried candidates also end it, since
 those accounts can become preferable. The next request triggers a new refresh;
 idle plugins issue no API calls. Cache hits do not extend the deadline, and new
 candidates do not preempt a still-valid selection. Tied accounts rotate only on
 reselection.
 
-Concurrent misses for a route share one refresh, with a separate wait deadline
-for each request. Waiting does not hold the cache lock or block valid cache hits.
-After a wait timeout, the background refresh continues and can populate the
-cache for later requests. All routes use one API worker,
+Concurrent misses for a route share one refresh without a fixed wait deadline.
+Waiting does not hold the cache lock or block valid cache hits. Each waiting
+request checks that the result still belongs to its candidates and queues a new
+refresh if needed. All routes use one API worker,
 which queries accounts sequentially. Failed or unsuccessful selections delegate
 to CPA and wait at least `retry_interval`, normally 20 seconds, before a later
 request can retry. A known earlier reset can shorten that wait. Individual API
@@ -182,13 +185,12 @@ it no longer controls this behavior, including when set to `false`.
 
 `request_timeout` defaults to `10s`. It limits each background management API
 request, including credential listing, usage forwarding and SIWC downloads.
-It also limits how long a scheduling request without a valid cached selection
-waits for a result, including queue time and any reselection needed to match
-its candidates. This wait deadline does not restart after a refresh completes.
-A wait timeout delegates the current request to CPA while the refresh continues.
-Sequential account queries can take longer than this limit in total. This
-setting does not limit inference execution time. Plugin shutdown cancels the
-refresh and wakes waiting scheduling requests.
+Sequential account queries can take longer than this limit in total.
+A scheduling request without a valid cached selection waits without a fixed
+timeout, including queue time and any reselection needed to match its candidates.
+A completed refresh with no selection delegates the request to CPA. Plugin
+shutdown or reconfiguration cancels the refresh and wakes waiting scheduling
+requests. This setting does not limit inference execution time.
 
 `retry_interval` defaults to `20s` after an unsuccessful refresh completes.
 Once the delay expires, a new scheduling request can trigger another refresh.

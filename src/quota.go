@@ -239,7 +239,7 @@ func parseResetTime(raw json.RawMessage) time.Time {
 }
 
 func (q quotaSnapshot) usable(model string, now time.Time, ttl time.Duration) (fiveReset, weekReset time.Time, ok bool) {
-	if q.fetchedAt.IsZero() || now.Before(q.fetchedAt) || now.Sub(q.fetchedAt) >= ttl {
+	if q.fetchedAt.IsZero() || now.Before(q.fetchedAt) || (ttl > 0 && now.Sub(q.fetchedAt) >= ttl) {
 		return time.Time{}, time.Time{}, false
 	}
 	found := [3]bool{}
